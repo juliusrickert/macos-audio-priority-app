@@ -1,5 +1,4 @@
 import AppKit
-import ServiceManagement
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -7,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let manager = AudioDeviceManager()
     private let store = PriorityStore()
     private lazy var engine = PriorityEngine(manager: manager, store: store)
+    private lazy var settings = SettingsModel(engine: engine)
 
     private var statusItem: NSStatusItem?
     private var window: NSWindow?
@@ -14,12 +14,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// UIDs present per direction, republished to the window after each scan.
     private let presentModel = PresentDevicesModel()
 
-    private let pauseKey = "autoSwitchPaused"
-
     // MARK: Lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        engine.isPaused = UserDefaults.standard.bool(forKey: pauseKey)
+        // A change made in the window (or the menu) refreshes the dropdown's
+        // checkmarks so both surfaces stay in sync.
+        settings.onChange = { [weak self] in self?.refreshMenu() }
 
         setupStatusItem()
 
@@ -41,8 +41,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rescan() {
         let devices = manager.currentDevices()
         store.merge(currentDevices: devices)
-        presentModel.update(from: devices)
         engine.reconcile()
+        // Read defaults after reconcile so the displayed names reflect any
+        // switch the engine just made.
+        let defaults: [Direction: String?] = [
+            .output: manager.defaultDevice(for: .output)?.name,
+            .input: manager.defaultDevice(for: .input)?.name,
+        ]
+        presentModel.update(from: devices, defaults: defaults)
         refreshMenu()
     }
 
@@ -71,12 +77,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let pause = NSMenuItem(title: "Pause Auto-Switching",
                                action: #selector(togglePause(_:)), keyEquivalent: "")
-        pause.state = engine.isPaused ? .on : .off
+        pause.state = settings.isPaused ? .on : .off
         menu.addItem(pause)
 
         let login = NSMenuItem(title: "Launch at Login",
                                action: #selector(toggleLogin(_:)), keyEquivalent: "")
-        login.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
+        login.state = settings.launchAtLogin ? .on : .off
         menu.addItem(login)
 
         // Items above target the AppDelegate (their selectors live here).
@@ -105,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showWindow(_ sender: Any?) {
         if window == nil {
-            let view = PriorityWindowContainer(store: store, present: presentModel) { [weak self] in
+            let view = PriorityWindowContainer(store: store, present: presentModel, settings: settings) { [weak self] in
                 self?.engine.reconcile()
                 self?.refreshMenu()
             }
@@ -123,38 +129,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePause(_ sender: NSMenuItem) {
-        engine.isPaused.toggle()
-        UserDefaults.standard.set(engine.isPaused, forKey: pauseKey)
-        if !engine.isPaused { engine.reconcile() }
-        refreshMenu()
+        // SettingsModel persists, mirrors into the engine, reconciles on
+        // unpause, and refreshes the menu via its onChange hook.
+        settings.isPaused.toggle()
     }
 
     @objc private func toggleLogin(_ sender: NSMenuItem) {
-        do {
-            if SMAppService.mainApp.status == .enabled {
-                try SMAppService.mainApp.unregister()
-            } else {
-                try SMAppService.mainApp.register()
-            }
-        } catch {
-            NSAlert(error: error).runModal()
-        }
-        refreshMenu()
+        settings.launchAtLogin.toggle()
     }
 }
 
-/// Observable mirror of which device UIDs are present, per direction, so the
-/// SwiftUI window updates connected/disconnected state without touching CoreAudio.
+/// Observable mirror of which device UIDs are present, per direction, plus the
+/// current default device name per direction, so the SwiftUI window reflects
+/// connected/disconnected state and the active defaults without touching CoreAudio.
 final class PresentDevicesModel: ObservableObject {
     @Published var byDirection: [Direction: Set<String>] = [:]
+    /// Current default device name per direction (nil when none).
+    @Published var defaultNames: [Direction: String] = [:]
 
-    func update(from devices: [AudioDevice]) {
+    func update(from devices: [AudioDevice], defaults: [Direction: String?]) {
         var map: [Direction: Set<String>] = [:]
         for direction in Direction.allCases {
             map[direction] = Set(
                 devices.filter { $0.participates(in: direction) }.map(\.uid))
         }
         byDirection = map
+        defaultNames = defaults.compactMapValues { $0 }
     }
 }
 
@@ -162,9 +162,15 @@ final class PresentDevicesModel: ObservableObject {
 private struct PriorityWindowContainer: View {
     @ObservedObject var store: PriorityStore
     @ObservedObject var present: PresentDevicesModel
+    @ObservedObject var settings: SettingsModel
     let onChange: () -> Void
 
     var body: some View {
-        PriorityWindow(store: store, presentUIDs: present.byDirection, onChange: onChange)
+        PriorityWindow(
+            store: store,
+            presentUIDs: present.byDirection,
+            defaultNames: present.defaultNames,
+            settings: settings,
+            onChange: onChange)
     }
 }
